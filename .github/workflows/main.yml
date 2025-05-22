@@ -1,4 +1,4 @@
-name: Pull Private Docker Image with Enhanced Logging
+name: Docker with Continuous Logging
 'on':
   push:
     branches:
@@ -12,386 +12,303 @@ name: Pull Private Docker Image with Enhanced Logging
         description: 'Part number (01, 02, etc.)'
         required: false
         default: '01'
-      log_level:
-        description: 'Log level (debug, info, warn, error)'
-        required: false
-        default: 'info'
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       
       - name: Pull Docker image
         run: 'docker pull ${{ secrets.DOCKERHUB_IMAGE_URL }}:latest'
       
-      - name: List Docker images
-        run: 'docker images ${{ secrets.DOCKERHUB_IMAGE_URL }}'
+      - name: Setup logging directories
+        run: |
+          mkdir -p ~/logs
+          mkdir -p ~/cloudflared
+          touch ~/logs/app.log
+          touch ~/logs/monitor.log
+          touch ~/cloudflared/tunnel.log
+          echo "Logging setup complete"
       
       - name: Install Cloudflared
         run: |
           curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
           chmod +x cloudflared
           sudo mv cloudflared /usr/local/bin/
+          echo "Cloudflared installed"
       
-      - name: Create logging infrastructure
+      - name: Start Docker container with logging
         run: |
-          # Create directories for logs
-          mkdir -p /tmp/logs
-          mkdir -p /tmp/cloudflared
-          
-          # Create log files
-          touch /tmp/logs/docker.log
-          touch /tmp/logs/api.log
-          touch /tmp/logs/combined.log
-          touch /tmp/cloudflared/tunnel.log
-          
-          # Set up log rotation to prevent disk space issues
-          echo "Setting up log infrastructure..."
-      
-      - name: Start the API container with enhanced logging
-        run: |
-          # Start container with detailed logging configuration
+          echo "Starting container..."
           docker run -d \
             -p 5001:5001 \
             --name api-container \
-            --log-driver json-file \
-            --log-opt max-size=100m \
-            --log-opt max-file=3 \
-            -e LOG_LEVEL=${{ github.event.inputs.log_level || 'info' }} \
+            --restart unless-stopped \
             ${{ secrets.DOCKERHUB_IMAGE_URL }}:latest
           
-          # Wait for the API to start
-          echo "Waiting for API to start..."
-          sleep 10
+          echo "Container started, waiting for initialization..."
+          sleep 15
           
-          # Test the API
-          curl -s http://localhost:5001/ || echo "Initial API test failed"
+          # Test container
+          if docker ps | grep -q api-container; then
+            echo "Container is running"
+            docker logs api-container
+          else
+            echo "Container failed to start"
+            docker ps -a
+            exit 1
+          fi
       
-      - name: Set up background log monitoring
+      - name: Start background log monitoring
         run: |
-          # Create a background script to continuously monitor Docker logs
-          cat << 'EOF' > /tmp/log_monitor.sh
+          # Create background monitoring script
+          cat > ~/monitor.sh << 'EOF'
           #!/bin/bash
-          LOG_FILE="/tmp/logs/combined.log"
-          
           while true; do
-            echo "=== $(date) - Docker Container Logs ===" >> "$LOG_FILE"
-            docker logs api-container --tail 50 >> "$LOG_FILE" 2>&1
-            echo "" >> "$LOG_FILE"
+            echo "=== $(date) ===" >> ~/logs/monitor.log
             
-            # Check container health
-            if ! docker ps | grep -q api-container; then
-              echo "=== $(date) - ALERT: Container stopped ===" >> "$LOG_FILE"
-              docker ps -a | grep api-container >> "$LOG_FILE"
+            # Check container status
+            if docker ps | grep -q api-container; then
+              echo "Container: RUNNING" >> ~/logs/monitor.log
+              docker logs api-container --tail 10 >> ~/logs/app.log 2>&1
+            else
+              echo "Container: STOPPED" >> ~/logs/monitor.log
+              docker ps -a | grep api-container >> ~/logs/monitor.log
             fi
             
-            # Rotate log if it gets too large (>50MB)
-            if [ -f "$LOG_FILE" ] && [ $(stat -f%z "$LOG_FILE" 2>/dev/null || stat -c%s "$LOG_FILE" 2>/dev/null || echo 0) -gt 52428800 ]; then
-              mv "$LOG_FILE" "${LOG_FILE}.$(date +%Y%m%d_%H%M%S)"
-              touch "$LOG_FILE"
-            fi
+            # Rotate logs if too large (>10MB)
+            for logfile in ~/logs/*.log; do
+              if [ -f "$logfile" ] && [ $(stat -c%s "$logfile" 2>/dev/null || echo 0) -gt 10485760 ]; then
+                mv "$logfile" "${logfile}.$(date +%s)"
+                touch "$logfile"
+              fi
+            done
             
             sleep 30
           done
           EOF
           
-          chmod +x /tmp/log_monitor.sh
-          
-          # Start the log monitor in background
-          /tmp/log_monitor.sh &
-          LOG_MONITOR_PID=$!
-          echo "LOG_MONITOR_PID=$LOG_MONITOR_PID" >> $GITHUB_ENV
-          echo "Log monitoring started with PID: $LOG_MONITOR_PID"
+          chmod +x ~/monitor.sh
+          ~/monitor.sh &
+          echo "Background monitoring started"
       
-      - name: Set up Cloudflare Tunnel with enhanced logging
+      - name: Setup Cloudflare tunnel
         run: |
-          # Start the ephemeral tunnel with enhanced logging
-          cloudflared tunnel \
-            --url http://localhost:5001 \
-            --logfile /tmp/cloudflared/tunnel.log \
-            --loglevel debug &
+          echo "Starting Cloudflare tunnel..."
+          cloudflared tunnel --url http://localhost:5001 --logfile ~/cloudflared/tunnel.log &
           TUNNEL_PID=$!
-          echo "TUNNEL_PID=$TUNNEL_PID" >> $GITHUB_ENV
           
-          # Wait for tunnel to initialize
-          sleep 15
+          # Wait for tunnel initialization
+          sleep 20
           
-          # Extract and display the tunnel URL
-          TUNNEL_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' /tmp/cloudflared/tunnel.log | tail -1)
-          
-          if [ -z "$TUNNEL_URL" ]; then
-            echo "Failed to extract tunnel URL, checking logs..."
-            cat /tmp/cloudflared/tunnel.log
-            exit 1
-          fi
-          
-          echo "::notice::Your application is available at: $TUNNEL_URL"
-          echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
-          
-          # Display initial tunnel logs
-          echo "Initial Cloudflare tunnel logs:"
-          tail -n 20 /tmp/cloudflared/tunnel.log
-      
-      - name: Set up continuous tunnel monitoring
-        run: |
-          # Create tunnel monitoring script
-          cat << 'EOF' > /tmp/tunnel_monitor.sh
-          #!/bin/bash
-          TUNNEL_LOG="/tmp/cloudflared/tunnel.log"
-          MONITOR_LOG="/tmp/logs/tunnel_monitor.log"
-          
-          while true; do
-            echo "=== $(date) - Tunnel Status ===" >> "$MONITOR_LOG"
+          # Extract tunnel URL
+          if [ -f ~/cloudflared/tunnel.log ]; then
+            TUNNEL_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' ~/cloudflared/tunnel.log | tail -1)
             
-            # Check if tunnel process is running
-            if ! kill -0 $TUNNEL_PID 2>/dev/null; then
-              echo "ALERT: Tunnel process died!" >> "$MONITOR_LOG"
-            fi
-            
-            # Check recent tunnel logs
-            tail -n 10 "$TUNNEL_LOG" >> "$MONITOR_LOG"
-            echo "" >> "$MONITOR_LOG"
-            
-            # Test tunnel connectivity
             if [ -n "$TUNNEL_URL" ]; then
-              HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$TUNNEL_URL" || echo "000")
-              echo "Tunnel HTTP Status: $HTTP_STATUS" >> "$MONITOR_LOG"
+              echo "Tunnel URL: $TUNNEL_URL"
+              echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
+              echo "::notice::Application available at: $TUNNEL_URL"
+            else
+              echo "Failed to get tunnel URL"
+              cat ~/cloudflared/tunnel.log
             fi
-            
-            sleep 60
-          done
-          EOF
-          
-          chmod +x /tmp/tunnel_monitor.sh
-          
-          # Start tunnel monitoring
-          TUNNEL_PID=${{ env.TUNNEL_PID }} TUNNEL_URL=${{ env.TUNNEL_URL }} /tmp/tunnel_monitor.sh &
-          TUNNEL_MONITOR_PID=$!
-          echo "TUNNEL_MONITOR_PID=$TUNNEL_MONITOR_PID" >> $GITHUB_ENV
+          else
+            echo "Tunnel log file not found"
+          fi
       
-      - name: Verify API through tunnel
+      - name: Test application
         run: |
-          # Comprehensive API verification
-          echo "Testing API accessibility..."
+          echo "Testing application..."
           
-          # Test direct connection
-          echo "Direct API test:"
-          curl -v http://localhost:5001/health || echo "Direct API test failed"
+          # Test local connection
+          curl -s http://localhost:5001/ || echo "Local test failed"
           
-          # Test through tunnel
+          # Test tunnel connection
           if [ -n "${{ env.TUNNEL_URL }}" ]; then
-            echo "Tunnel API test:"
-            curl -v ${{ env.TUNNEL_URL }}/health || echo "Tunnel API test failed"
+            sleep 10
+            curl -s ${{ env.TUNNEL_URL }}/ || echo "Tunnel test failed"
           fi
       
       - name: Update repository status
-        if: success() && env.TUNNEL_URL != ''
+        if: env.TUNNEL_URL != ''
         run: |
           REPO_NAME=$(echo "$GITHUB_REPOSITORY" | cut -d'/' -f2)
           
-          JSON_PAYLOAD=$(cat << EOF
-          {
-            "repository_name": "$REPO_NAME",
-            "status": "Active",
-            "cloudflare_tunnel_url": "${{ env.TUNNEL_URL }}",
-            "last_updated": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-            "workflow_run_id": "${{ github.run_id }}"
-          }
-          EOF
-          )
-          
           curl -X POST \
             -H "Content-Type: application/json" \
-            -d "$JSON_PAYLOAD" \
-            https://update-repository-status.vercel.app/api/update_repository_status
-          
-          echo "::notice::Repository status updated"
+            -d "{\"repository_name\":\"$REPO_NAME\",\"status\":\"Active\",\"cloudflare_tunnel_url\":\"${{ env.TUNNEL_URL }}\"}" \
+            https://update-repository-status.vercel.app/api/update_repository_status || echo "Status update failed"
       
-      - name: Set up log streaming endpoint
+      - name: Start log display service
         run: |
-          # Create a simple log streaming service
-          cat << 'EOF' > /tmp/log_server.py
+          # Simple HTTP server to display logs
+          cat > ~/log_server.py << 'EOF'
           #!/usr/bin/env python3
           import http.server
           import socketserver
           import os
-          import json
-          from datetime import datetime
           
           class LogHandler(http.server.SimpleHTTPRequestHandler):
               def do_GET(self):
                   if self.path == '/logs':
                       self.send_response(200)
                       self.send_header('Content-type', 'text/plain')
-                      self.send_header('Access-Control-Allow-Origin', '*')
                       self.end_headers()
                       
                       try:
-                          with open('/tmp/logs/combined.log', 'r') as f:
-                              self.wfile.write(f.read().encode())
-                      except FileNotFoundError:
-                          self.wfile.write(b'No logs available yet')
+                          with open(os.path.expanduser('~/logs/app.log'), 'r') as f:
+                              content = f.read()
+                              self.wfile.write(content.encode())
+                      except:
+                          self.wfile.write(b'No logs available')
                   
-                  elif self.path == '/status':
+                  elif self.path == '/monitor':
                       self.send_response(200)
-                      self.send_header('Content-type', 'application/json')
-                      self.send_header('Access-Control-Allow-Origin', '*')
+                      self.send_header('Content-type', 'text/plain')
                       self.end_headers()
                       
-                      status = {
-                          'timestamp': datetime.utcnow().isoformat(),
-                          'container_running': os.system('docker ps | grep -q api-container') == 0,
-                          'tunnel_url': os.environ.get('TUNNEL_URL', 'Not available'),
-                          'workflow_run_id': os.environ.get('GITHUB_RUN_ID', 'Unknown')
-                      }
-                      
-                      self.wfile.write(json.dumps(status, indent=2).encode())
-                  
+                      try:
+                          with open(os.path.expanduser('~/logs/monitor.log'), 'r') as f:
+                              content = f.read()
+                              self.wfile.write(content.encode())
+                      except:
+                          self.wfile.write(b'No monitor logs available')
                   else:
-                      super().do_GET()
+                      self.send_response(404)
+                      self.end_headers()
           
-          PORT = 8080
-          with socketserver.TCPServer(("", PORT), LogHandler) as httpd:
-              print(f"Log server running on port {PORT}")
+          with socketserver.TCPServer(("", 8080), LogHandler) as httpd:
               httpd.serve_forever()
           EOF
           
           # Start log server in background
-          python3 /tmp/log_server.py &
-          LOG_SERVER_PID=$!
-          echo "LOG_SERVER_PID=$LOG_SERVER_PID" >> $GITHUB_ENV
+          python3 ~/log_server.py &
           echo "Log server started on port 8080"
       
-      - name: Display monitoring information
+      - name: Display access information
         run: |
-          echo "=== MONITORING SETUP COMPLETE ==="
-          echo "Application URL: ${{ env.TUNNEL_URL }}"
-          echo "Logs endpoint: ${{ env.TUNNEL_URL }}/logs (if tunnel supports port 8080)"
-          echo "Status endpoint: ${{ env.TUNNEL_URL }}/status"
+          echo "================================="
+          echo "APPLICATION ACCESS INFORMATION"
+          echo "================================="
+          echo "Main Application: ${{ env.TUNNEL_URL }}"
+          echo "Application Logs: ${{ env.TUNNEL_URL }}:8080/logs (if port 8080 is accessible)"
+          echo "Monitor Logs: ${{ env.TUNNEL_URL }}:8080/monitor"
           echo ""
-          echo "Log files location:"
-          echo "- Combined logs: /tmp/logs/combined.log"
-          echo "- Tunnel logs: /tmp/cloudflared/tunnel.log"
-          echo "- Tunnel monitor: /tmp/logs/tunnel_monitor.log"
+          echo "Container Status:"
+          docker ps | grep api-container || echo "Container not running"
           echo ""
-          echo "Background processes:"
-          echo "- Log Monitor PID: ${{ env.LOG_MONITOR_PID }}"
-          echo "- Tunnel PID: ${{ env.TUNNEL_PID }}"
-          echo "- Tunnel Monitor PID: ${{ env.TUNNEL_MONITOR_PID }}"
-          echo "- Log Server PID: ${{ env.LOG_SERVER_PID }}"
+          echo "Recent Application Logs:"
+          docker logs api-container --tail 20 || echo "Cannot fetch logs"
       
-      - name: Keep container and services running
+      - name: Monitor and keep alive
         if: github.event_name == 'workflow_dispatch'
         run: |
-          echo "Services will run for 30 minutes for monitoring..."
+          echo "Starting 30-minute monitoring session..."
           
-          # Periodic status updates
-          for i in {1..30}; do
-            echo "=== Minute $i Status Update ==="
-            echo "Container status:"
-            docker ps | grep api-container || echo "Container not running!"
+          # Monitor for 30 minutes with status updates every 2 minutes
+          for i in {1..15}; do
+            echo ""
+            echo "=== Status Update $i/15 ($(date)) ==="
             
-            echo "Recent container logs:"
-            docker logs api-container --tail 5 2>&1 || echo "Cannot fetch container logs"
+            # Container status
+            if docker ps | grep -q api-container; then
+              echo "✓ Container is running"
+            else
+              echo "✗ Container is not running"
+              docker ps -a | grep api-container
+            fi
             
+            # Tunnel connectivity
+            if [ -n "${{ env.TUNNEL_URL }}" ]; then
+              HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" ${{ env.TUNNEL_URL }}/ || echo "000")
+              if [ "$HTTP_CODE" = "200" ]; then
+                echo "✓ Tunnel is accessible (HTTP $HTTP_CODE)"
+              else
+                echo "✗ Tunnel issue (HTTP $HTTP_CODE)"
+              fi
+            fi
+            
+            # Recent logs
+            echo "Recent container output:"
+            docker logs api-container --tail 3 2>&1 | head -3
+            
+            # Log file sizes
             echo "Log file sizes:"
-            ls -lh /tmp/logs/ 2>/dev/null || echo "No log files found"
+            ls -lh ~/logs/*.log 2>/dev/null | awk '{print $5, $9}' || echo "No log files"
             
-            echo "Tunnel connectivity test:"
-            curl -s -o /dev/null -w "HTTP %{http_code} - %{time_total}s\n" ${{ env.TUNNEL_URL }}/health || echo "Tunnel test failed"
-            
-            echo "Waiting 1 minute..."
-            sleep 60
+            echo "Waiting 2 minutes..."
+            sleep 120
           done
           
-          echo "Monitoring period complete."
+          echo "Monitoring session complete"
       
-      - name: Archive logs before cleanup
+      - name: Collect final logs
         if: always()
         run: |
-          echo "Archiving logs..."
+          echo "Collecting final logs..."
           
-          # Create archive directory
-          mkdir -p /tmp/log_archive
+          mkdir -p ~/final_logs
           
           # Copy all logs
-          cp -r /tmp/logs/* /tmp/log_archive/ 2>/dev/null || echo "No logs to archive"
-          cp /tmp/cloudflared/tunnel.log /tmp/log_archive/tunnel.log 2>/dev/null || echo "No tunnel log to archive"
+          cp ~/logs/*.log ~/final_logs/ 2>/dev/null || echo "No app logs to copy"
+          cp ~/cloudflared/tunnel.log ~/final_logs/ 2>/dev/null || echo "No tunnel log to copy"
           
-          # Get final container logs
-          docker logs api-container > /tmp/log_archive/final_docker.log 2>&1 || echo "Cannot get final container logs"
+          # Get final container state
+          echo "=== Final Container Status ===" > ~/final_logs/container_status.txt
+          docker ps -a >> ~/final_logs/container_status.txt
+          
+          echo "=== Final Container Logs ===" > ~/final_logs/final_container.log
+          docker logs api-container >> ~/final_logs/final_container.log 2>&1 || echo "Cannot get container logs"
           
           # Create summary
-          cat << EOF > /tmp/log_archive/summary.txt
-          Workflow Summary
-          ===============
-          Run ID: ${{ github.run_id }}
-          Repository: ${{ github.repository }}
-          Timestamp: $(date)
-          Tunnel URL: ${{ env.TUNNEL_URL }}
+          echo "Workflow: ${{ github.workflow }}" > ~/final_logs/summary.txt
+          echo "Run ID: ${{ github.run_id }}" >> ~/final_logs/summary.txt
+          echo "Repository: ${{ github.repository }}" >> ~/final_logs/summary.txt
+          echo "Tunnel URL: ${{ env.TUNNEL_URL }}" >> ~/final_logs/summary.txt
+          echo "Timestamp: $(date)" >> ~/final_logs/summary.txt
           
-          Final Container Status:
-          $(docker ps -a | grep api-container || echo "Container not found")
-          
-          EOF
+          echo "Final logs collected:"
+          ls -la ~/final_logs/
+      
+      - name: Archive logs
+        if: always()
+        run: |
+          # Create tar archive of all logs
+          cd ~
+          tar -czf workflow-logs-${{ github.run_id }}.tar.gz final_logs/
           
           echo "Log archive created:"
-          ls -la /tmp/log_archive/
+          ls -lh workflow-logs-*.tar.gz
+          
+          # Display archive contents
+          echo "Archive contents:"
+          tar -tzf workflow-logs-${{ github.run_id }}.tar.gz
       
-      - name: Upload logs as artifacts
-        if: always()
-        uses: actions/upload-artifact@v3
-        with:
-          name: application-logs-${{ github.run_id }}
-          path: /tmp/log_archive/
-          retention-days: 7
-      
-      - name: Final status check
-        if: always()
+      - name: Sleep before next iteration
         run: |
-          echo "=== FINAL STATUS ==="
-          echo "Container status:"
-          docker ps -a | grep api-container || echo "No container found"
-          
-          echo "Background processes:"
-          ps aux | grep -E "(log_monitor|tunnel_monitor|log_server)" | grep -v grep || echo "No background processes found"
-          
-          echo "Tunnel URL: ${{ env.TUNNEL_URL }}"
-          
-          # Test final connectivity
-          if [ -n "${{ env.TUNNEL_URL }}" ]; then
-            echo "Final connectivity test:"
-            curl -s ${{ env.TUNNEL_URL }}/health || echo "Final connectivity test failed"
-          fi
-      
-      - name: Wait before next iteration
-        run: |
-          echo "Sleeping for 5 hours before next iteration..."
+          echo "Sleeping for 5 hours..."
           sleep 18000
 
   trigger_next:
     needs: deploy
-    runs-on: ubuntu-latest
     if: always()
+    runs-on: ubuntu-latest
     steps:
-      - name: Trigger next chunk
-        uses: actions/github-script@v6
-        with:
-          github-token: '${{ secrets.GITHUB_TOKEN }}'
-          script: |
-            const currentPart = context.payload.inputs?.part || '01';
-            const next = String(parseInt(currentPart) + 1).padStart(2, '0');
-            
-            await github.rest.actions.createWorkflowDispatch({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              workflow_id: context.workflow,
-              ref: context.ref.replace('refs/heads/', ''),
-              inputs: { 
-                part: next,
-                log_level: context.payload.inputs?.log_level || 'info'
-              }
-            });
+      - name: Get next part number
+        id: next_part
+        run: |
+          CURRENT_PART="${{ github.event.inputs.part || '01' }}"
+          NEXT_PART=$(printf "%02d" $((10#$CURRENT_PART + 1)))
+          echo "next_part=$NEXT_PART" >> $GITHUB_OUTPUT
+          echo "Next part will be: $NEXT_PART"
+      
+      - name: Trigger next workflow
+        run: |
+          curl -X POST \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/${{ github.workflow }}/dispatches \
+            -d '{"ref":"${{ github.ref_name }}","inputs":{"part":"${{ steps.next_part.outputs.next_part }}"}}'
