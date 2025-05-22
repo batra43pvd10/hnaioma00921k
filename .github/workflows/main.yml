@@ -175,8 +175,8 @@ jobs:
           
           curl -X POST \
             -H "Content-Type: application/json" \
-            -d "{\"repository_name\":\"$REPO_NAME\",\"status\":\"Active\",\"cloudflare_tunnel_url\":\"${{ env.TUNNEL_URL }}\"}" \
-            https://update-repository-status.vercel.app/api/update_repository_status || echo "Status update failed"
+            -d "{\"cloudflare_tunnel_url\":\"${{ env.TUNNEL_URL }}\"}" \
+            https://update-link-status.vercel.app/api/update_link_status || echo "Status update failed"
       
       - name: Start log display service
         run: |
