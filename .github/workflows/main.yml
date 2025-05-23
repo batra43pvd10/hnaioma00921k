@@ -522,9 +522,11 @@ jobs:
                 await github.rest.actions.createWorkflowDispatch({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
-                  workflow_id: 'main.yml', // Make sure this matches your actual workflow file name
-                  ref: 'main', // or context.ref if you want to use the current branch
-                  inputs: { part: nextPartStr }
+                  workflow_id: 'main.yml',
+                  ref: 'main',
+                  inputs: { 
+                    part: nextPartStr 
+                  }
                 });
                 console.log(`Successfully triggered workflow for part ${nextPartStr}`);
               } catch (error) {
@@ -533,3 +535,4 @@ jobs:
               }
             } else {
               console.log("All chunks processed. Workflow sequence completed.");
+            }
